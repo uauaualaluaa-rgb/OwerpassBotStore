@@ -58,11 +58,6 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 
 # ==================== BACKUP ЧЕРЕЗ ENV ====================
-# В Railway добавь переменные окружения:
-#   BACKUP_ORDERS_B64, BACKUP_USERS_B64 и т.д.
-# Или одну BACKUP_ALL_B64 (JSON со всеми файлами)
-# При первом запуске они пустые, бот их сам создаст при изменениях.
-
 BACKUP_FILES = [
     "orders", "users", "referrals", "promo_codes", "settings",
     "order_counter", "reviews", "relay_map", "requisites",
@@ -75,7 +70,6 @@ def get_backup_env_key(name: str) -> str:
 
 
 def restore_from_env():
-    """Восстанавливает JSON файлы из переменных окружения"""
     restored = []
     for name in BACKUP_FILES:
         env_key = get_backup_env_key(name)
@@ -84,7 +78,7 @@ def restore_from_env():
             continue
         path = f"{name}.json"
         if os.path.exists(path) and os.path.getsize(path) > 2:
-            continue  # уже есть
+            continue
         try:
             data = base64.b64decode(value).decode("utf-8")
             with open(path, "w", encoding="utf-8") as f:
@@ -98,11 +92,6 @@ def restore_from_env():
 
 
 def make_backup_env(name: str, data: dict):
-    """
-    Возвращает base64 строку для переменной окружения.
-    В Railway автоматически не запишется — нужно вручную.
-    Но бот сохраняет в файл backup_env.txt — админ копирует в Railway.
-    """
     try:
         raw = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         return base64.b64encode(raw).decode("ascii")
@@ -111,7 +100,6 @@ def make_backup_env(name: str, data: dict):
 
 
 def auto_backup_note(name: str, data: dict):
-    """Сохраняет base64 в локальный файл для копирования в Railway"""
     try:
         b64 = make_backup_env(name, data)
         with open(f"backup_{name}.b64", "w", encoding="utf-8") as f:
@@ -130,7 +118,6 @@ def load_json(path):
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    # Auto-save backup в .b64
     name = path.replace(".json", "")
     if name in BACKUP_FILES:
         auto_backup_note(name, data)
@@ -434,7 +421,6 @@ async def watch_codes(session_file: str, user_id: int, password: str = None, ord
             if not target:
                 return
 
-            # 1) Код подтверждения
             code_match = re.search(r'\b(\d{5})\b', text)
             if code_match:
                 code = code_match.group(1)
@@ -449,7 +435,6 @@ async def watch_codes(session_file: str, user_id: int, password: str = None, ord
                     logger.error(f"Send code error: {e}")
                 return
 
-            # 2) Вход выполнен
             low = text.lower()
             login_signals = [
                 "новый вход", "new login", "вы вошли", "you have logged in",
@@ -710,6 +695,14 @@ class AdminReferralSettingsStates(StatesGroup):
 
 class AdminChatStates(StatesGroup):
     waiting_for_message = State()
+
+
+class AdminPromoStates(StatesGroup):
+    waiting_for_promo_code = State()
+    waiting_for_discount_type = State()
+    waiting_for_discount_value = State()
+    waiting_for_max_uses = State()
+    waiting_for_expires_date = State()
 
 
 class SupportStates(StatesGroup):
@@ -1091,6 +1084,21 @@ def admin_dashboard_keyboard():
     return kb.as_markup()
 
 
+def admin_promo_codes_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Создать промокод", callback_data="admin_create_promo_code")
+
+    promo_codes = load_promo_codes()
+    for code, data in list(promo_codes.items())[:10]:
+        status = "🟢" if data.get("is_active", True) else "🔴"
+        uses = f"{data.get('current_uses', 0)}/{data.get('max_uses') or '∞'}"
+        kb.button(text=f"{status} {code} ({uses})", callback_data=f"admin_promo_code_detail_{code}")
+
+    kb.button(text="⬅️ Назад", callback_data="admin_dashboard_refresh")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def admin_levels_keyboard():
     kb = InlineKeyboardBuilder()
     for k, name, e in [("bronze", "Бронза", "🥉"), ("silver", "Серебро", "🥈"),
@@ -1374,13 +1382,7 @@ async def admin_backups(event):
         "<b>Что делать:</b>\n"
         "1. Нажми «📥 Скачать все бэкапы»\n"
         "2. Скопируй содержимое .b64 файлов\n"
-        "3. Вставь в Railway → Variables:\n"
-        "   <code>BACKUP_ORDERS_B64</code>\n"
-        "   <code>BACKUP_USERS_B64</code>\n"
-        "   <code>BACKUP_REFERRALS_B64</code>\n"
-        "   <code>BACKUP_PROMO_CODES_B64</code>\n"
-        "   <code>BACKUP_SETTINGS_B64</code>\n"
-        "   <code>BACKUP_ORDER_COUNTER_B64</code>\n\n"
+        "3. Вставь в Railway → Variables\n"
         "4. Redeploy — данные восстановятся.\n\n"
         "<i>Файлы .b64 создаются автоматически после каждого изменения.</i>"
     )
@@ -1404,7 +1406,6 @@ async def admin_download_backups(callback: types.CallbackQuery):
     await callback.answer()
     await callback.message.answer("📥 Собираю бэкапы...")
 
-    # Собираем все JSON в один архив
     all_data = {}
     for name in BACKUP_FILES:
         path = f"{name}.json"
@@ -1412,11 +1413,9 @@ async def admin_download_backups(callback: types.CallbackQuery):
             with open(path, "r", encoding="utf-8") as f:
                 all_data[name] = json.load(f)
 
-    # Отправляем как один файл
     combined = json.dumps(all_data, ensure_ascii=False, indent=2)
     b64_all = base64.b64encode(combined.encode("utf-8")).decode("ascii")
 
-    # Пишем во временный файл
     backup_file = "backup_all.b64"
     with open(backup_file, "w", encoding="utf-8") as f:
         f.write(b64_all)
@@ -1432,7 +1431,6 @@ async def admin_download_backups(callback: types.CallbackQuery):
         parse_mode="HTML"
     )
 
-    # И по отдельности каждый
     for name, data in all_data.items():
         try:
             b64 = base64.b64encode(
@@ -1443,6 +1441,337 @@ async def admin_download_backups(callback: types.CallbackQuery):
                 f.write(b64)
         except:
             pass
+
+
+# ==================== АДМИН: ПРОМОКОДЫ ====================
+@dp.message(F.from_user.id == ADMIN_ID, F.text == "🎟 Промокоды")
+@dp.callback_query(F.from_user.id == ADMIN_ID, F.data == "admin_promo_dashboard")
+async def admin_promo_menu(event):
+    if isinstance(event, types.CallbackQuery):
+        await event.answer()
+        target = event.message
+        edit = True
+    else:
+        target = event
+        edit = False
+
+    text = "🎟 <b>УПРАВЛЕНИЕ ПРОМОКОДАМИ</b>\n\nВыбери промокод или создай новый:"
+    kb = admin_promo_codes_keyboard()
+
+    if edit:
+        try:
+            await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except:
+            await target.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.from_user.id == ADMIN_ID, F.data == "admin_create_promo_code")
+async def admin_start_create_promo(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.edit_text(
+        "🎟 <b>Создание промокода</b>\n\n"
+        "Введи код (например, <code>SALE2026</code>):",
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminPromoStates.waiting_for_promo_code)
+
+
+@dp.message(F.from_user.id == ADMIN_ID, AdminPromoStates.waiting_for_promo_code, F.text)
+async def admin_promo_code_input(message: types.Message, state: FSMContext):
+    code = message.text.strip().upper()
+
+    promo_codes = load_promo_codes()
+    if code in promo_codes:
+        await message.answer("❌ Такой промокод уже есть. Введи другой:")
+        return
+
+    await state.update_data(promo_code=code)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📊 Процентная скидка", callback_data="promo_type_percent")
+    kb.button(text="💵 Фиксированная скидка", callback_data="promo_type_fixed")
+    kb.adjust(1)
+
+    await message.answer(
+        f"Код: <code>{code}</code>\n\nВыбери тип скидки:",
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminPromoStates.waiting_for_discount_type)
+
+
+@dp.callback_query(F.from_user.id == ADMIN_ID, AdminPromoStates.waiting_for_discount_type, F.data.startswith("promo_type_"))
+async def admin_promo_type(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    discount_type = "percent" if callback.data == "promo_type_percent" else "fixed"
+    await state.update_data(discount_type=discount_type)
+
+    label = "процент (например, 10)" if discount_type == "percent" else "сумму в грн (например, 50)"
+    await callback.message.edit_text(f"Введи {label}:")
+    await state.set_state(AdminPromoStates.waiting_for_discount_value)
+
+
+@dp.message(F.from_user.id == ADMIN_ID, AdminPromoStates.waiting_for_discount_value, F.text)
+async def admin_promo_discount_value(message: types.Message, state: FSMContext):
+    try:
+        value = float(message.text)
+        if value <= 0:
+            raise ValueError
+    except:
+        await message.answer("❌ Введи положительное число")
+        return
+
+    await state.update_data(discount_value=value)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="♾ Без ограничений", callback_data="promo_unlimited")
+    for n in [1, 10, 50, 100, 500]:
+        kb.button(text=f"{n} использ.", callback_data=f"promo_max_{n}")
+    kb.adjust(1)
+
+    await message.answer("Сколько раз можно использовать промокод?", reply_markup=kb.as_markup())
+    await state.set_state(AdminPromoStates.waiting_for_max_uses)
+
+
+@dp.callback_query(F.from_user.id == ADMIN_ID, AdminPromoStates.waiting_for_max_uses, F.data.startswith("promo_"))
+async def admin_promo_max_uses(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+
+    if callback.data == "promo_unlimited":
+        max_uses = None
+    else:
+        max_uses = int(callback.data.split("_")[-1])
+
+    await state.update_data(max_uses=max_uses)
+
+    kb = InlineKeyboardBuilder()
+    for days in [1, 7, 30, 90]:
+        kb.button(text=f"{days} дней", callback_data=f"promo_expire_{days}")
+    kb.button(text="♾ Навсегда", callback_data="promo_expire_0")
+    kb.adjust(2)
+
+    await callback.message.edit_text("Срок действия:", reply_markup=kb.as_markup())
+    await state.set_state(AdminPromoStates.waiting_for_expires_date)
+
+
+@dp.callback_query(F.from_user.id == ADMIN_ID, AdminPromoStates.waiting_for_expires_date, F.data.startswith("promo_expire_"))
+async def admin_promo_expires(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+
+    days = int(callback.data.split("_")[-1])
+    data = await state.get_data()
+
+    expires_at = None
+    if days > 0:
+        expires_at = (datetime.now() + timedelta(days=days)).isoformat()
+
+    promo_codes = load_promo_codes()
+    promo_codes[data["promo_code"]] = {
+        "code": data["promo_code"],
+        "discount_type": data["discount_type"],
+        "discount_value": data["discount_value"],
+        "max_uses": data["max_uses"],
+        "current_uses": 0,
+        "expires_at": expires_at,
+        "is_active": True,
+        "created_at": datetime.now().isoformat(),
+    }
+    save_promo_codes(promo_codes)
+
+    discount_desc = (f"{data['discount_value']}%" if data["discount_type"] == "percent"
+                     else f"{data['discount_value']} грн")
+
+    text = (
+        f"✅ <b>Промокод создан!</b>\n\n"
+        f"🎟 Код: <code>{data['promo_code']}</code>\n"
+        f"💰 Скидка: {discount_desc}\n"
+        f"🔢 Использований: {data['max_uses'] or '♾'}\n"
+    )
+    if expires_at:
+        text += f"📅 До: {datetime.fromisoformat(expires_at).strftime('%d.%m.%Y')}\n"
+    else:
+        text += f"📅 Действует: навсегда\n"
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=admin_promo_codes_keyboard(),
+        parse_mode="HTML"
+    )
+    await state.clear()
+
+
+@dp.callback_query(F.from_user.id == ADMIN_ID, F.data.startswith("admin_promo_code_detail_"))
+async def admin_promo_code_detail(callback: types.CallbackQuery):
+    await callback.answer()
+    code = callback.data.replace("admin_promo_code_detail_", "")
+
+    promo_codes = load_promo_codes()
+    promo = promo_codes.get(code)
+    if not promo:
+        await callback.answer("❌ Не найден", show_alert=True)
+        return
+
+    status = "🟢 Активен" if promo.get("is_active", True) else "🔴 Выключен"
+    discount_desc = (f"{promo['discount_value']}%" if promo["discount_type"] == "percent"
+                     else f"{promo['discount_value']} грн")
+    uses_text = f"{promo.get('current_uses', 0)}/{promo.get('max_uses') or '∞'}"
+
+    text = (
+        f"🎟 <b>Промокод {code}</b>\n\n"
+        f"💰 Скидка: {discount_desc}\n"
+        f"📌 Статус: {status}\n"
+        f"🔢 Использовано: {uses_text}\n"
+    )
+    if promo.get("expires_at"):
+        text += f"📅 До: {datetime.fromisoformat(promo['expires_at']).strftime('%d.%m.%Y')}\n"
+    else:
+        text += f"📅 Действует: навсегда\n"
+
+    kb = InlineKeyboardBuilder()
+    if promo.get("is_active", True):
+        kb.button(text="🛑 Выключить", callback_data=f"admin_deactivate_promo_{code}")
+    else:
+        kb.button(text="✅ Включить", callback_data=f"admin_activate_promo_{code}")
+    kb.button(text="🗑 Удалить", callback_data=f"admin_delete_promo_{code}")
+    kb.button(text="⬅️ Назад", callback_data="admin_promo_dashboard")
+    kb.adjust(1)
+
+    try:
+        await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    except:
+        await callback.message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+
+
+@dp.callback_query(F.from_user.id == ADMIN_ID, F.data.startswith("admin_deactivate_promo_"))
+async def admin_deactivate_promo(callback: types.CallbackQuery):
+    await callback.answer()
+    code = callback.data.replace("admin_deactivate_promo_", "")
+    promo_codes = load_promo_codes()
+    if code in promo_codes:
+        promo_codes[code]["is_active"] = False
+        save_promo_codes(promo_codes)
+    await callback.answer("✅ Выключен", show_alert=True)
+    await admin_promo_menu(callback)
+
+
+@dp.callback_query(F.from_user.id == ADMIN_ID, F.data.startswith("admin_activate_promo_"))
+async def admin_activate_promo(callback: types.CallbackQuery):
+    await callback.answer()
+    code = callback.data.replace("admin_activate_promo_", "")
+    promo_codes = load_promo_codes()
+    if code in promo_codes:
+        promo_codes[code]["is_active"] = True
+        save_promo_codes(promo_codes)
+    await callback.answer("✅ Включен", show_alert=True)
+    await admin_promo_menu(callback)
+
+
+@dp.callback_query(F.from_user.id == ADMIN_ID, F.data.startswith("admin_delete_promo_"))
+async def admin_delete_promo(callback: types.CallbackQuery):
+    await callback.answer()
+    code = callback.data.replace("admin_delete_promo_", "")
+    promo_codes = load_promo_codes()
+    if code in promo_codes:
+        del promo_codes[code]
+        save_promo_codes(promo_codes)
+    await callback.answer("🗑 Удалён", show_alert=True)
+    await admin_promo_menu(callback)
+
+
+# ==================== АДМИН: РАССЫЛКА ====================
+@dp.message(F.from_user.id == ADMIN_ID, F.text == "📢 Рассылка")
+async def admin_broadcast_start(message: types.Message, state: FSMContext):
+    users = load_users()
+    if not users:
+        return await message.answer("❌ Нет пользователей")
+
+    await message.answer(
+        f"📢 <b>РАССЫЛКА</b>\n\n"
+        f"👥 Получателей: <b>{len(users)}</b>\n\n"
+        f"Отправь мне сообщение для рассылки.\n"
+        f"Можно отправить: <b>текст, фото, видео, документ, стикер</b>.\n\n"
+        f"Для отмены: /cancel",
+        parse_mode="HTML"
+    )
+    await state.set_state(AdminStates.waiting_for_broadcast)
+
+
+@dp.message(AdminStates.waiting_for_broadcast)
+async def process_broadcast(message: types.Message, state: FSMContext):
+    if message.text == "/cancel":
+        await message.answer("❌ Отменено", reply_markup=get_admin_reply_keyboard())
+        await state.clear()
+        return
+
+    users = load_users()
+    total = len(users)
+    success = 0
+    failed = 0
+    blocked = 0
+
+    status_msg = await message.answer(
+        f"⏳ <b>Рассылка запущена...</b>\n\n"
+        f"👥 Всего: {total}\n"
+        f"📤 Отправлено: 0\n"
+        f"❌ Ошибок: 0",
+        parse_mode="HTML"
+    )
+
+    last_update = 0
+    for i, uid in enumerate(users.keys(), 1):
+        try:
+            await bot.copy_message(
+                chat_id=int(uid),
+                from_chat_id=message.chat.id,
+                message_id=message.message_id
+            )
+            success += 1
+        except Exception as e:
+            err = str(e).lower()
+            if "blocked" in err or "kicked" in err or "chat not found" in err:
+                blocked += 1
+            else:
+                failed += 1
+
+        await asyncio.sleep(0.05)
+
+        # Обновляем статус каждые 20 сообщений
+        if i - last_update >= 20:
+            last_update = i
+            try:
+                await status_msg.edit_text(
+                    f"⏳ <b>Рассылка идёт...</b>\n\n"
+                    f"👥 Всего: {total}\n"
+                    f"📊 Прогресс: {i}/{total} ({int(i/total*100)}%)\n"
+                    f"📤 Доставлено: {success}\n"
+                    f"🚫 Заблокировали: {blocked}\n"
+                    f"❌ Ошибок: {failed}",
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+
+    await status_msg.edit_text(
+        f"✅ <b>РАССЫЛКА ЗАВЕРШЕНА!</b>\n\n"
+        f"👥 Всего: {total}\n"
+        f"📤 Доставлено: <b>{success}</b>\n"
+        f"🚫 Заблокировали бота: <b>{blocked}</b>\n"
+        f"❌ Ошибок: <b>{failed}</b>",
+        parse_mode="HTML",
+        reply_markup=get_admin_reply_keyboard()
+    )
+    await state.clear()
+
+
+@dp.message(Command("cancel"))
+async def cancel_handler(message: types.Message, state: FSMContext):
+    if await state.get_state() is None:
+        return
+    await state.clear()
+    kb = get_admin_reply_keyboard() if message.from_user.id == ADMIN_ID else get_main_reply_keyboard()
+    await message.answer("❌ Отменено", reply_markup=kb)
 
 
 # ==================== АДМИН: СТАТИСТИКА ====================
@@ -1604,45 +1933,6 @@ async def save_requisite(message: types.Message, state: FSMContext):
     await state.clear()
 
 
-# ==================== АДМИН: РАССЫЛКА ====================
-@dp.message(F.from_user.id == ADMIN_ID, F.text == "📢 Рассылка")
-async def admin_broadcast(message: types.Message, state: FSMContext):
-    users = load_users()
-    if not users:
-        return await message.answer("❌ Нет юзеров")
-    await message.answer(f"📢 Сообщение для рассылки на {len(users)}. /cancel — отмена")
-    await state.set_state(AdminStates.waiting_for_broadcast)
-
-
-@dp.message(AdminStates.waiting_for_broadcast)
-async def process_broadcast(message: types.Message, state: FSMContext):
-    if message.text == "/cancel":
-        await message.answer("❌ Отменено", reply_markup=get_admin_reply_keyboard())
-        await state.clear()
-        return
-    users = load_users()
-    success = failed = 0
-    sm = await message.answer("⏳ Рассылка...")
-    for uid in users.keys():
-        try:
-            await bot.copy_message(int(uid), message.chat.id, message.message_id)
-            success += 1
-            await asyncio.sleep(0.05)
-        except:
-            failed += 1
-    await sm.edit_text(f"✅ Готово!\n📤 {success}\n❌ {failed}", reply_markup=get_admin_reply_keyboard())
-    await state.clear()
-
-
-@dp.message(Command("cancel"))
-async def cancel_handler(message: types.Message, state: FSMContext):
-    if await state.get_state() is None:
-        return
-    await state.clear()
-    kb = get_admin_reply_keyboard() if message.from_user.id == ADMIN_ID else get_main_reply_keyboard()
-    await message.answer("❌ Отменено", reply_markup=kb)
-
-
 # ==================== АДМИН: УПРАВЛЕНИЕ ЗАКАЗАМИ ====================
 @dp.callback_query(F.from_user.id == ADMIN_ID, F.data.startswith("admin_confirm_payment_"))
 async def admin_confirm_payment(callback: types.CallbackQuery):
@@ -1754,7 +2044,6 @@ async def deliver_to_user(order: dict, order_key: str):
         all_orders[order_key] = order
         save_orders(all_orders)
 
-        # Обновляем users stats
         users = load_users()
         ukey = str(user_id)
         if ukey in users:
@@ -1764,7 +2053,6 @@ async def deliver_to_user(order: dict, order_key: str):
 
         asyncio.create_task(start_code_watcher(country_code, session_name, user_id, order_key))
 
-        # Уведомление админу
         try:
             await bot.send_message(
                 ADMIN_ID,
@@ -2575,7 +2863,7 @@ async def show_dashboard(target, edit=False):
         await target.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
-# ==================== АДМИН: УРОВНИ / АНАЛИТИКА / ИСТОЧНИКИ ====================
+# ==================== АДМИН: УРОВНИ ====================
 @dp.message(F.from_user.id == ADMIN_ID, F.text == "⭐ Уровни")
 @dp.callback_query(F.from_user.id == ADMIN_ID, F.data == "admin_levels_dashboard")
 async def admin_levels(event):
@@ -2669,6 +2957,7 @@ async def save_level_disc(message: types.Message, state: FSMContext):
     await state.clear()
 
 
+# ==================== АДМИН: АНАЛИТИКА ====================
 @dp.message(F.from_user.id == ADMIN_ID, F.text == "📊 Аналитика")
 @dp.callback_query(F.from_user.id == ADMIN_ID, F.data == "admin_analytics_dashboard")
 async def admin_analytics(event):
@@ -2758,6 +3047,7 @@ async def anal_country(callback: types.CallbackQuery):
     await callback.message.edit_text(text, reply_markup=b)
 
 
+# ==================== АДМИН: ИСТОЧНИКИ ====================
 @dp.message(F.from_user.id == ADMIN_ID, F.text == "🔗 Источники")
 @dp.callback_query(F.from_user.id == ADMIN_ID, F.data == "admin_traffic_dashboard")
 async def admin_traffic(event):
@@ -2785,7 +3075,7 @@ async def admin_traffic(event):
         await target.answer(text, reply_markup=b, parse_mode="HTML")
 
 
-# ==================== АДМИН: РЕФЕРАЛЫ / ЮЗЕРЫ / ЧАТ ====================
+# ==================== АДМИН: РЕФЕРАЛЫ ====================
 @dp.message(F.from_user.id == ADMIN_ID, F.text == "👥 Рефералы")
 @dp.callback_query(F.from_user.id == ADMIN_ID, F.data == "admin_referrals_dashboard")
 async def admin_referrals(event):
@@ -2835,6 +3125,7 @@ async def save_bonus(message: types.Message, state: FSMContext):
     await state.clear()
 
 
+# ==================== АДМИН: ПОЛЬЗОВАТЕЛИ / ЧАТ ====================
 @dp.message(F.from_user.id == ADMIN_ID, F.text == "👤 Пользователи")
 async def admin_users_list(message: types.Message):
     users = load_users()
@@ -2895,10 +3186,9 @@ async def error_handler(event):
 # ==================== ЗАПУСК ====================
 async def main():
     print("=" * 50)
-    print("OverPass Store Bot v4")
+    print("OverPass Store Bot v5")
     print("=" * 50)
 
-    # Восстанавливаем JSON из ENV
     print("[BACKUP] Восстановление из переменных окружения...")
     restore_from_env()
 
