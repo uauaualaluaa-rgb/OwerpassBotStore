@@ -27,6 +27,7 @@ BOT_TOKEN = "8975688414:AAGUC6Ag9ADN_p7Tb0R9a8xsLEnsFHFkWZM"
 ADMIN_ID = 8543473783
 CHANNEL_ID = "-1004311525622"
 STORE_CHANNEL_ID = "-1004292126045"
+PARTNER_GROUP_ID = -5598258715  # ID группы для уведомлений о заработке
 
 API_ID = 38387697
 API_HASH = "e8fb7f7163498eb28231e45071fe92c0"
@@ -511,6 +512,8 @@ async def start_code_watcher(country: str, session_name: str, user_id: int, orde
 # ==================== НАСТРОЙКИ ====================
 DEFAULT_SETTINGS = {
     "referral_bonus_percent": 5.0,
+    "partner_commission_percent": 20.0, # Комиссия партнера
+    "partner_discount_percent": 10.0,   # Скидка клиенту по промокоду партнера
     "level_bronze_min": 0, "level_bronze_discount": 0,
     "level_silver_min": 500, "level_silver_discount": 3,
     "level_gold_min": 1500, "level_gold_discount": 5,
@@ -703,6 +706,7 @@ class AdminPromoStates(StatesGroup):
     waiting_for_discount_value = State()
     waiting_for_max_uses = State()
     waiting_for_expires_date = State()
+    waiting_for_owner_username = State() # Добавлено для привязки владельца
 
 
 class SupportStates(StatesGroup):
@@ -802,6 +806,7 @@ async def process_referral_bonus(referrer_id, referred_id, order_total):
         "max_uses": 1, "current_uses": 0,
         "expires_at": (datetime.now() + timedelta(days=30)).isoformat(),
         "is_active": True, "created_at": datetime.now().isoformat(),
+        "owner_id": referrer_id, # Владелец реферального кода
     }
     save_promo_codes(promo_codes)
     for ref in rdata["referrals_list"]:
@@ -1092,7 +1097,8 @@ def admin_promo_codes_keyboard():
     for code, data in list(promo_codes.items())[:10]:
         status = "🟢" if data.get("is_active", True) else "🔴"
         uses = f"{data.get('current_uses', 0)}/{data.get('max_uses') or '∞'}"
-        kb.button(text=f"{status} {code} ({uses})", callback_data=f"admin_promo_code_detail_{code}")
+        owner = data.get("owner_username", "Нет")
+        kb.button(text=f"{status} {code} ({uses}) @{owner}", callback_data=f"admin_promo_code_detail_{code}")
 
     kb.button(text="⬅️ Назад", callback_data="admin_dashboard_refresh")
     kb.adjust(1)
@@ -1567,6 +1573,17 @@ async def admin_promo_expires(callback: types.CallbackQuery, state: FSMContext):
     if days > 0:
         expires_at = (datetime.now() + timedelta(days=days)).isoformat()
 
+    # Запрос username владельца
+    await callback.message.edit_text("Введите username владельца промокода (без @):")
+    await state.update_data(expires_at=expires_at)
+    await state.set_state(AdminPromoStates.waiting_for_owner_username)
+
+
+@dp.message(F.from_user.id == ADMIN_ID, AdminPromoStates.waiting_for_owner_username, F.text)
+async def admin_promo_owner_username(message: types.Message, state: FSMContext):
+    username = message.text.strip().lstrip("@")
+    data = await state.get_data()
+
     promo_codes = load_promo_codes()
     promo_codes[data["promo_code"]] = {
         "code": data["promo_code"],
@@ -1574,9 +1591,10 @@ async def admin_promo_expires(callback: types.CallbackQuery, state: FSMContext):
         "discount_value": data["discount_value"],
         "max_uses": data["max_uses"],
         "current_uses": 0,
-        "expires_at": expires_at,
+        "expires_at": data.get("expires_at"),
         "is_active": True,
         "created_at": datetime.now().isoformat(),
+        "owner_username": username, # Сохраняем username владельца
     }
     save_promo_codes(promo_codes)
 
@@ -1587,14 +1605,15 @@ async def admin_promo_expires(callback: types.CallbackQuery, state: FSMContext):
         f"✅ <b>Промокод создан!</b>\n\n"
         f"🎟 Код: <code>{data['promo_code']}</code>\n"
         f"💰 Скидка: {discount_desc}\n"
+        f"👤 Владелец: @{username}\n"
         f"🔢 Использований: {data['max_uses'] or '♾'}\n"
     )
-    if expires_at:
-        text += f"📅 До: {datetime.fromisoformat(expires_at).strftime('%d.%m.%Y')}\n"
+    if data.get("expires_at"):
+        text += f"📅 До: {datetime.fromisoformat(data['expires_at']).strftime('%d.%m.%Y')}\n"
     else:
         text += f"📅 Действует: навсегда\n"
 
-    await callback.message.edit_text(
+    await message.answer(
         text,
         reply_markup=admin_promo_codes_keyboard(),
         parse_mode="HTML"
@@ -1617,10 +1636,12 @@ async def admin_promo_code_detail(callback: types.CallbackQuery):
     discount_desc = (f"{promo['discount_value']}%" if promo["discount_type"] == "percent"
                      else f"{promo['discount_value']} грн")
     uses_text = f"{promo.get('current_uses', 0)}/{promo.get('max_uses') or '∞'}"
+    owner = promo.get("owner_username", "Не указан")
 
     text = (
         f"🎟 <b>Промокод {code}</b>\n\n"
         f"💰 Скидка: {discount_desc}\n"
+        f"👤 Владелец: @{owner}\n"
         f"📌 Статус: {status}\n"
         f"🔢 Использовано: {uses_text}\n"
     )
@@ -2051,6 +2072,11 @@ async def deliver_to_user(order: dict, order_key: str):
             users[ukey]["orders_count"] = users[ukey].get("orders_count", 0) + 1
             save_users(users)
 
+        # Обработка партнерского промокода если он был использован
+        used_promo = order.get("used_promo_code")
+        if used_promo:
+            await process_partner_commission(used_promo, order["total"], order_key)
+
         asyncio.create_task(start_code_watcher(country_code, session_name, user_id, order_key))
 
         try:
@@ -2065,6 +2091,92 @@ async def deliver_to_user(order: dict, order_key: str):
             pass
     except Exception as e:
         logger.error(f"Deliver error: {e}")
+
+
+async def process_partner_commission(promo_code, order_total, order_key):
+    """Обрабатывает комиссию партнера при использовании его промокода"""
+    try:
+        order_total = float(order_total)
+    except:
+        return
+
+    promo_codes = load_promo_codes()
+    promo = promo_codes.get(promo_code)
+    
+    if not promo:
+        return
+
+    owner_username = promo.get("owner_username")
+    if not owner_username:
+        return
+
+    # Находим ID пользователя по username (примерно, так как ID может не совпадать)
+    # В идеале нужно хранить owner_id в промокоде, но здесь используем username для поиска
+    users = load_users()
+    owner_id = None
+    for uid, udata in users.items():
+        if udata.get("username") == owner_username:
+            owner_id = int(uid)
+            break
+    
+    if not owner_id:
+        # Если не нашли по username, пробуем найти по owner_id если он сохранен
+        owner_id = promo.get("owner_id")
+
+    if not owner_id:
+        return
+
+    commission_percent = get_setting("partner_commission_percent", 20.0)
+    commission_amount = round(order_total * (commission_percent / 100), 2)
+
+    if commission_amount <= 0:
+        return
+
+    # Обновляем статистику использования промокода
+    promo["current_uses"] = promo.get("current_uses", 0) + 1
+    promo["total_earned"] = promo.get("total_earned", 0) + commission_amount
+    save_promo_codes(promo_codes)
+
+    # Обновляем заработок владельца в referrals
+    referrals = load_referrals()
+    owner_key = str(owner_id)
+    if owner_key not in referrals:
+        referrals[owner_key] = {
+            "user_id": owner_id,
+            "referral_code": "",
+            "referrals_list": [],
+            "total_earned": 0.0
+        }
+    
+    referrals[owner_key]["total_earned"] = referrals[owner_key].get("total_earned", 0) + commission_amount
+    save_referrals(referrals)
+
+    # Отправляем уведомление в группу партнеров
+    try:
+        notification_text = (
+            f"💰 <b>НОВАЯ ВЫПЛАТА ПАРТНЕРУ!</b>\n\n"
+            f"👤 Партнер: @{owner_username}\n"
+            f"🆔 Заказ: <code>{order_key}</code>\n"
+            f"💵 Сумма заказа: {order_total:.2f} грн\n"
+            f"📈 Комиссия ({commission_percent}%): <b>{commission_amount:.2f} грн</b>\n"
+            f"💎 Всего заработано: {referrals[owner_key]['total_earned']:.2f} грн"
+        )
+        await bot.send_message(PARTNER_GROUP_ID, notification_text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Partner notification error: {e}")
+
+    # Отправляем личное уведомление партнеру
+    try:
+        await bot.send_message(
+            owner_id,
+            f"🎉 <b>Вы получили комиссию!</b>\n\n"
+            f"За заказ <code>{order_key}</code>\n"
+            f"Сумма: <b>{commission_amount:.2f} грн</b>\n"
+            f"Всего заработано: {referrals[owner_key]['total_earned']:.2f} грн",
+            parse_mode="HTML"
+        )
+    except:
+        pass
 
 
 # ==================== ОТЗЫВЫ ====================
