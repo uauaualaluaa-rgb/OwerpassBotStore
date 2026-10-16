@@ -27,7 +27,7 @@ BOT_TOKEN = "8975688414:AAGUC6Ag9ADN_p7Tb0R9a8xsLEnsFHFkWZM"
 ADMIN_ID = 8543473783
 CHANNEL_ID = "-1004311525622"
 STORE_CHANNEL_ID = "-1004292126045"
-PARTNER_GROUP_ID = -5598258715  # ID группы для уведомлений о заработке
+PARTNER_GROUP_ID = -5598258715  # ID группы для уведомлений о заработке партнеров
 
 API_ID = 38387697
 API_HASH = "e8fb7f7163498eb28231e45071fe92c0"
@@ -513,7 +513,7 @@ async def start_code_watcher(country: str, session_name: str, user_id: int, orde
 DEFAULT_SETTINGS = {
     "referral_bonus_percent": 5.0,
     "partner_commission_percent": 20.0, # Комиссия партнера
-    "partner_discount_percent": 10.0,   # Скидка клиенту по промокоду партнера
+    "partner_discount_percent": 10.0,   # Скидка клиенту по промокоду партнера (для инфо)
     "level_bronze_min": 0, "level_bronze_discount": 0,
     "level_silver_min": 500, "level_silver_discount": 3,
     "level_gold_min": 1500, "level_gold_discount": 5,
@@ -674,6 +674,7 @@ class ReviewStates(StatesGroup):
 
 class OrderStates(StatesGroup):
     waiting_for_quantity = State()
+    waiting_for_promo_input = State()
     waiting_for_payment_method = State()
     waiting_for_confirmation = State()
 
@@ -706,7 +707,7 @@ class AdminPromoStates(StatesGroup):
     waiting_for_discount_value = State()
     waiting_for_max_uses = State()
     waiting_for_expires_date = State()
-    waiting_for_owner_username = State() # Добавлено для привязки владельца
+    waiting_for_owner_username = State()
 
 
 class SupportStates(StatesGroup):
@@ -806,7 +807,7 @@ async def process_referral_bonus(referrer_id, referred_id, order_total):
         "max_uses": 1, "current_uses": 0,
         "expires_at": (datetime.now() + timedelta(days=30)).isoformat(),
         "is_active": True, "created_at": datetime.now().isoformat(),
-        "owner_id": referrer_id, # Владелец реферального кода
+        "owner_id": referrer_id,
     }
     save_promo_codes(promo_codes)
     for ref in rdata["referrals_list"]:
@@ -2110,8 +2111,7 @@ async def process_partner_commission(promo_code, order_total, order_key):
     if not owner_username:
         return
 
-    # Находим ID пользователя по username (примерно, так как ID может не совпадать)
-    # В идеале нужно хранить owner_id в промокоде, но здесь используем username для поиска
+    # Находим ID пользователя по username
     users = load_users()
     owner_id = None
     for uid, udata in users.items():
@@ -2813,15 +2813,114 @@ async def process_quantity(callback: types.CallbackQuery, state: FSMContext):
 
     acc = avail[0]
     await state.update_data(price_uah=acc["price_uah"])
+    
+    # Сохраняем базовую цену для расчета скидки
+    await state.update_data(base_price=acc["price_uah"])
 
     text = (f"📦 {data['product']}\n"
             f"💰 {acc['price_uah']}₴\n\n"
-            f"Способ оплаты:")
+            f"Есть промокод? Введите его или нажмите 'Пропустить':")
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏩ Пропустить промокод", callback_data="skip_promo")
+    kb.adjust(1)
 
     try:
-        await callback.message.edit_text(text, reply_markup=payment_method_keyboard())
+        await callback.message.edit_text(text, reply_markup=kb.as_markup())
     except:
-        await callback.message.answer(text, reply_markup=payment_method_keyboard())
+        await callback.message.answer(text, reply_markup=kb.as_markup())
+    
+    await state.set_state(OrderStates.waiting_for_promo_input)
+
+
+@dp.callback_query(OrderStates.waiting_for_promo_input, F.data == "skip_promo")
+async def skip_promo_code(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.update_data(used_promo_code=None)
+    await state.update_data(discount_amount=0)
+    await state.update_data(final_price=await get_final_price(state))
+    
+    data = await state.get_data()
+    final_price = data.get("final_price")
+    
+    text = (f"💳 Способ оплаты:\n"
+            f"Итого к оплате: <b>{final_price}₴</b>")
+            
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🎁 Оплатить подарком", callback_data="pay_gift")
+    kb.button(text="💳 Оплатить гривнами", callback_data="pay_uah")
+    kb.button(text="❌ Отмена", callback_data="main_menu")
+    kb.adjust(1)
+    
+    try:
+        await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    except:
+        await callback.message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+        
+    await state.set_state(OrderStates.waiting_for_payment_method)
+
+
+@dp.message(OrderStates.waiting_for_promo_input, F.text)
+async def process_promo_input(message: types.Message, state: FSMContext):
+    code = message.text.strip().upper()
+    promos = load_promo_codes()
+    p = promos.get(code)
+    
+    valid = False
+    discount_amount = 0
+    
+    if p and p.get("is_active", True):
+        # Проверка лимитов
+        max_uses = p.get("max_uses")
+        current_uses = p.get("current_uses", 0)
+        
+        if not max_uses or current_uses < max_uses:
+            # Проверка срока действия
+            if not p.get("expires_at") or datetime.now() < datetime.fromisoformat(p["expires_at"]):
+                valid = True
+                # Расчет скидки
+                base_price = (await state.get_data()).get("base_price", 0)
+                if p["discount_type"] == "percent":
+                    discount_amount = round(base_price * (p["discount_value"] / 100), 2)
+                else:
+                    discount_amount = min(p["discount_value"], base_price) # Не может быть больше цены
+    
+    if valid:
+        await state.update_data(used_promo_code=code)
+        await state.update_data(discount_amount=discount_amount)
+        await state.update_data(final_price=await get_final_price(state))
+        
+        await message.answer(
+            f"✅ Промокод <code>{code}</code> применен!\n"
+            f"Скидка: -{discount_amount}₴", 
+            parse_mode="HTML"
+        )
+        await show_payment_methods_after_promo(message, state)
+    else:
+        await message.answer("❌ Промокод недействителен, истек или исчерпан. Попробуйте другой или пропустите.")
+
+
+async def get_final_price(state: FSMContext):
+    data = await state.get_data()
+    base_price = data.get("base_price", 0)
+    discount = data.get("discount_amount", 0)
+    return max(0, base_price - discount)
+
+
+async def show_payment_methods_after_promo(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    final_price = data.get("final_price", data.get("price_uah"))
+    
+    text = (f"💳 Способ оплаты:\n"
+            f"Итого к оплате: <b>{final_price}₴</b>")
+            
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🎁 Оплатить подарком", callback_data="pay_gift")
+    kb.button(text="💳 Оплатить гривнами", callback_data="pay_uah")
+    kb.button(text="❌ Отмена", callback_data="main_menu")
+    kb.adjust(1)
+    
+    await message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
     await state.set_state(OrderStates.waiting_for_payment_method)
 
 
@@ -2832,12 +2931,18 @@ async def process_payment_method(callback: types.CallbackQuery, state: FSMContex
     await state.update_data(payment_method=method)
 
     data = await state.get_data()
-    price_uah = data.get("price_uah")
+    final_price = data.get("final_price", data.get("price_uah"))
+    used_promo = data.get("used_promo_code")
+    
+    promo_text = ""
+    if used_promo:
+        promo_text = f"🎟 Промокод: <code>{used_promo}</code>\n"
 
     text = (f"📋 Подтверждение\n"
             f"Товар: {data['product']}\n"
             f"Оплата: {'🎁 Подарок' if method == 'gift' else '💳 Гривны'}\n"
-            f"Сумма: {price_uah}₴\n\n"
+            f"{promo_text}"
+            f"Сумма: {final_price}₴\n\n"
             f"Подтвердить?")
 
     try:
@@ -2856,6 +2961,8 @@ async def confirm_order(callback: types.CallbackQuery, state: FSMContext):
     product = data["product"]
     code = data["code"]
     method = data["payment_method"]
+    used_promo = data.get("used_promo_code")
+    final_price = data.get("final_price", data.get("price_uah"))
 
     acc = reserve_account(code, callback.from_user.id)
     if not acc:
@@ -2864,7 +2971,13 @@ async def confirm_order(callback: types.CallbackQuery, state: FSMContext):
         return
 
     short_id = generate_short_order_id()
-    total = acc["price_uah"]
+    
+    # Если есть промокод, увеличиваем счетчик использований
+    if used_promo:
+        promos = load_promo_codes()
+        if used_promo in promos:
+            promos[used_promo]["current_uses"] = promos[used_promo].get("current_uses", 0) + 1
+            save_promo_codes(promos)
 
     orders = load_orders()
     orders[short_id] = {
@@ -2874,7 +2987,9 @@ async def confirm_order(callback: types.CallbackQuery, state: FSMContext):
         "category": category, "product": product, "code": code,
         "country_code": acc["country"], "session_name": acc["session_name"],
         "phone": acc["phone"],
-        "payment_method": method, "total": total,
+        "payment_method": method, 
+        "total": final_price, # Сохраняем итоговую цену со скидкой
+        "used_promo_code": used_promo, # Сохраняем использованный промокод
         "status": "awaiting_payment",
         "created_at": datetime.now().isoformat(),
         "reviewed": False,
@@ -2888,7 +3003,8 @@ async def confirm_order(callback: types.CallbackQuery, state: FSMContext):
             f"👤 @{callback.from_user.username} | {callback.from_user.full_name}\n"
             f"🆔 <code>{callback.from_user.id}</code>\n"
             f"🌍 {acc['country'].upper()} | 📱 {acc['phone']}\n"
-            f"💰 {total}₴ | {'🎁 Подарок' if method == 'gift' else '💳 Гривны'}\n\n"
+            f"💰 {final_price}₴ | {'🎁 Подарок' if method == 'gift' else '💳 Гривны'}\n"
+            f"{'🎟 Промо: ' + used_promo if used_promo else ''}\n\n"
             f"Подтвердите оплату в <b>📋 Все заказы</b>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardBuilder().button(
@@ -2904,7 +3020,7 @@ async def confirm_order(callback: types.CallbackQuery, state: FSMContext):
         f"✅ <b>Заказ {short_id} создан!</b>\n\n"
         f"🌍 {acc['country'].upper()}\n"
         f"📱 {acc['phone']}\n"
-        f"💰 <b>{total}₴</b>\n"
+        f"💰 <b>{final_price}₴</b>\n"
         f"💳 Способ: {'🎁 Подарок' if method == 'gift' else '💳 Гривны'}\n\n"
         f"<b>РЕКВИЗИТЫ:</b>\n{requisites}\n\n"
         f"После оплаты напишите @MaskYoY и пришлите чек.",
